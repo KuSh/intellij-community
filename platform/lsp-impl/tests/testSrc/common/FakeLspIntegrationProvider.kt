@@ -21,6 +21,7 @@ internal fun TestFixture<Project>.fakeLspIntegrationFixture(
   configureServerCapabilities: (ServerCapabilities.() -> Unit)? = null,
   createLsp4jClient: ((LspServerNotificationsHandler) -> Lsp4jClient)? = null,
   isSupportedFile: ((VirtualFile) -> Boolean)? = null,
+  autoRestartSupport: Boolean = false,
 ): TestFixture<FakeLspIntegration> = testFixture { _ ->
   val projectFixture = this@fakeLspIntegrationFixture
   val project = projectFixture.init()
@@ -34,6 +35,7 @@ internal fun TestFixture<Project>.fakeLspIntegrationFixture(
   project.putUserData(FAKE_LSP_SERVER_CAPABILITIES_KEY, configureServerCapabilities)
   project.putUserData(FAKE_LSP_CREATE_CLIENT_KEY, createLsp4jClient)
   project.putUserData(FAKE_LSP_IS_SUPPORTED_FILE_KEY, isSupportedFile)
+  project.putUserData(FAKE_LSP_AUTO_RESTART_SUPPORT_KEY, autoRestartSupport)
 
   initialized(FakeLspIntegration()) {
     project.putUserData(FAKE_LSP_CUSTOMIZATION_KEY, null)
@@ -41,6 +43,7 @@ internal fun TestFixture<Project>.fakeLspIntegrationFixture(
     project.putUserData(FAKE_LSP_SERVER_CAPABILITIES_KEY, null)
     project.putUserData(FAKE_LSP_CREATE_CLIENT_KEY, null)
     project.putUserData(FAKE_LSP_IS_SUPPORTED_FILE_KEY, null)
+    project.putUserData(FAKE_LSP_AUTO_RESTART_SUPPORT_KEY, null)
   }
 }
 
@@ -53,6 +56,7 @@ internal val FAKE_LSP_SERVER_CAPABILITIES_KEY = Key.create<ServerCapabilities.()
 internal val FAKE_LSP_CLIENT_CAPABILITIES_KEY = Key.create<ClientCapabilities.() -> Unit>("FAKE_LSP_CLIENT_CAPABILITIES_KEY")
 internal val FAKE_LSP_CREATE_CLIENT_KEY = Key.create<(LspServerNotificationsHandler) -> Lsp4jClient>("FAKE_LSP_CREATE_CLIENT_KEY")
 internal val FAKE_LSP_IS_SUPPORTED_FILE_KEY = Key.create<(VirtualFile) -> Boolean>("FAKE_LSP_IS_SUPPORTED_FILE_KEY")
+internal val FAKE_LSP_AUTO_RESTART_SUPPORT_KEY = Key.create<Boolean>("FAKE_LSP_AUTO_RESTART_SUPPORT_KEY")
 
 internal class FakeLspIntegrationProvider : LspIntegrationProvider {
   override fun fileOpened(project: Project, file: VirtualFile, clientStarter: LspIntegrationProvider.LspClientStarter) {
@@ -77,6 +81,9 @@ internal open class FakeLspClientDescriptor(
   presentableName: String = "FakeLspServer",
 ) : ProjectWideLspClientDescriptor(project, presentableName) {
   lateinit var server: FakeLspServer
+
+  override val autoRestartSupport: Boolean
+    get() = project.getUserData(FAKE_LSP_AUTO_RESTART_SUPPORT_KEY) ?: false
 
   override fun isSupportedFile(file: VirtualFile) = supportedFilePredicate?.invoke(file) ?: true
 

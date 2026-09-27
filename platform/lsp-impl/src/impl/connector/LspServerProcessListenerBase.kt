@@ -17,6 +17,6 @@ internal open class LspServerProcessListenerBase(private val lspClient: LspClien
     val manager = ReadAction.computeBlocking<LspClientManagerImpl?, Throwable> {
       if (!lspClient.project.isDisposed) LspClientManagerImpl.getInstanceImpl(lspClient.project) else null
     }
-    manager?.handleMaybeUnexpectedServerStop(lspClient, text)
+    manager?.handleMaybeUnexpectedServerStop(lspClient, text, serverGone = true)
   }
 }

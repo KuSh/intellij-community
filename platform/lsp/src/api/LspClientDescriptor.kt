@@ -423,6 +423,22 @@ abstract class LspClientDescriptor protected constructor(
   open val lspCustomization: LspCustomization = LspCustomization()
 
   /**
+   * Set this property to `true` to let the IDE restart the server automatically.
+   * The IDE starts a new client with this descriptor when the process of a running server ends or its connection closes.
+   * The IDE calls [LspServerListener.serverStopped] for the stopped client before [LspServerListener.serverInitialized] for the new client.
+   * The IDE does not restart a client that never reached the Running state.
+   *
+   * An explicit stop of the client cancels a pending restart, for example [LspClientManager.stopClients].
+   * The registry keys `lsp.server.auto.restart.*` set the limits of the restarts.
+   * The value `0` of `lsp.server.auto.restart.max.count` turns off the automatic restart for all descriptors.
+   *
+   * Keep the default when the plugin restarts the server itself.
+   * Do not start a client with another server id for the same server, because then the server runs twice.
+   */
+  @get:ApiStatus.Experimental
+  open val autoRestartSupport: Boolean = false
+
+  /**
    * Override this function to handle
    * [workspace/configuration](https://microsoft.github.io/language-server-protocol/specifications/specification-current/#workspace_configuration)
    * requests from the server. Implementations should check `item.section` and respond only to the requests that they understand.

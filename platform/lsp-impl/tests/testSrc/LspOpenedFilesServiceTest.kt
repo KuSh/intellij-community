@@ -104,6 +104,24 @@ internal class LspOpenedFilesServiceTest {
   }
 
   @Test
+  fun `a start request captured before a stop of a stopped client does not revive the client`() = timeoutRunBlocking(2.minutes) {
+    val covered = createLocalFile("covered.txt")
+    val manager = LspClientManagerImpl.getInstanceImpl(project)
+    val service = LspOpenedFilesService.getInstance(project)
+    val providerClass = provider.javaClass
+
+    awaitRunningClient(manager) { service.processOpenedFiles(listOf(covered)) }
+    val client = manager.getClients(providerClass).single()
+    stopAndWait(manager) { manager.stopRunningServer(client) }
+    val staleRequestStamp = manager.startRequestStamp()
+
+    manager.stopRunningServer(client)
+
+    manager.ensureStarted(providerClass, client.descriptor, staleRequestStamp)!!.join()
+    assertTrue(manager.getClients(providerClass).isEmpty(), "the stale start request must not revive the client")
+  }
+
+  @Test
   fun `a single-client stop does not suppress a queued start of a sibling client`() = timeoutRunBlocking(2.minutes) {
     val covered = createLocalFile("covered.txt")
     val manager = LspClientManagerImpl.getInstanceImpl(project)

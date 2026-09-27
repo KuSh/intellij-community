@@ -19,6 +19,7 @@ import com.intellij.platform.lsp.api.LspClientManagerListener
 import com.intellij.platform.lsp.api.LspCommunicationChannel
 import com.intellij.platform.lsp.api.LspCommunicationChannel.StdIO
 import com.intellij.platform.lsp.api.LspIntegrationProvider
+import com.intellij.platform.lsp.api.LspServerListener
 import com.intellij.platform.lsp.api.LspServerState
 import com.intellij.platform.lsp.api.customization.LspInheritanceMarker
 import com.intellij.platform.lsp.api.customization.LspInheritanceMarkersSupport
@@ -42,6 +43,7 @@ import com.intellij.util.concurrency.Semaphore
 import com.intellij.util.concurrency.annotations.RequiresBackgroundThread
 import com.intellij.util.concurrency.annotations.RequiresReadLock
 import com.intellij.util.text.nullize
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.launch
 import org.eclipse.lsp4j.CodeLens
 import org.eclipse.lsp4j.Color
@@ -89,6 +91,21 @@ class LspClientImpl internal constructor(
       eventBroadcaster.serverStateChanged(this)
     }
   private val stateLock = Any()
+
+  /**
+   * `true` after an explicit stop of this client, for example, [LspClientManagerImpl.stopRunningServer].
+   * The manager sets it before the state of the client changes.
+   * The manager reads and writes it only under its start-stop lock.
+   * The manager never restarts a client with this flag automatically.
+   */
+  internal var stopRequested: Boolean = false
+
+  /**
+   * Completes after the first stop of this client, when the IDE has released the connection to the server.
+   * When the connector exists, the IDE has called [LspServerListener.serverStopped] by then.
+   * An exception in that listener does not change the outcome. A failed release completes it exceptionally.
+   */
+  internal val disconnected: CompletableDeferred<Unit> = CompletableDeferred()
 
   override var initializeResult: InitializeResult? = null
     private set
@@ -360,7 +377,8 @@ class LspClientImpl internal constructor(
           if (!project.isDisposed) LspClientManagerImpl.getInstanceImpl(project) else null
         }
         val text = (if (e is LspInitializationException) "$e\nCaused by:\n" else "") + exToLog.stackTraceToString()
-        manager?.handleMaybeUnexpectedServerStop(this, text)
+        // After the Running state, the steps above do no I/O with the server, so a failure after that state is a failure in the IDE
+        manager?.handleMaybeUnexpectedServerStop(this, text, serverGone = false)
       }
     }
   }
@@ -370,12 +388,24 @@ class LspClientImpl internal constructor(
     is LspCommunicationChannel.Socket -> Lsp4jServerConnectorSocket(this)
   }
 
-  internal fun ensureServerStopped(explicitStop: Boolean, updateLspServerManagerState: () -> Unit) {
+  /**
+   * When this call stops the client, [afterStop] gets the state before the stop.
+   * [afterStop] runs after [shutdownAndExit] returns, and also when [shutdownAndExit] throws an exception.
+   * On the EDT or under read access, [shutdownAndExit] only schedules the release, so [afterStop] can run before it.
+   * To know the outcome of the release, wait for [disconnected].
+   */
+  internal fun ensureServerStopped(
+    explicitStop: Boolean,
+    afterStop: (previousState: LspServerState) -> Unit = {},
+    updateLspServerManagerState: () -> Unit,
+  ) {
+    val previousState: LspServerState
     synchronized(stateLock) {
       updateLspServerManagerState()
 
       if (state in arrayOf(LspServerState.ShutdownNormally, LspServerState.ShutdownUnexpectedly)) return // already shut down
 
+      previousState = state
       logInfo("Stopping LSP server ${if (explicitStop) "normally" else "unexpectedly"}")
       state = if (explicitStop) LspServerState.ShutdownNormally else LspServerState.ShutdownUnexpectedly
 
@@ -402,14 +432,34 @@ class LspClientImpl internal constructor(
 
     // A graceful `shutdown`/`exit` handshake only makes sense for an explicit stop of a still-responsive server.
     // On an unexpected stop the server-to-IDE channel is already dead, so skip the handshake and just disconnect.
-    shutdownAndExit(graceful = explicitStop)
+    try {
+      shutdownAndExit(graceful = explicitStop)
+    }
+    catch (e: Throwable) {
+      try {
+        afterStop(previousState)
+      }
+      catch (secondary: Throwable) {
+        e.addSuppressed(secondary)
+      }
+      throw e
+    }
+    afterStop(previousState)
   }
 
   private fun shutdownAndExit(graceful: Boolean) {
     val shutdownAndExit = Runnable {
-      synchronized(connectorLock) {
-        if (::lsp4jServerConnector.isInitialized) lsp4jServerConnector.shutdownExitDisconnect(graceful)
+      try {
+        synchronized(connectorLock) {
+          if (::lsp4jServerConnector.isInitialized) lsp4jServerConnector.shutdownExitDisconnect(graceful)
+        }
       }
+      catch (e: Throwable) {
+        // the connector has already completed `disconnected` when only the listener failed
+        disconnected.completeExceptionally(e)
+        throw e
+      }
+      disconnected.complete(Unit)
     }
 
     if (ApplicationManager.getApplication().isDispatchThread || ApplicationManager.getApplication().isReadAccessAllowed) {

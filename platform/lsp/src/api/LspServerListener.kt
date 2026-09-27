@@ -29,6 +29,9 @@ interface LspServerListener {
    * - the response to the [initialize](https://microsoft.github.io/language-server-protocol/specification/#initialize)
    * request has not arrived
    * - the LSP server process has terminated
+   *
+   * When the process of a running server ends or its connection closes, the IDE restarts the server automatically
+   * only if [LspClientDescriptor.autoRestartSupport] is `true`. Then the IDE calls [serverInitialized] again after [serverStopped].
    */
   @RequiresBackgroundThread(generateAssertion = false /* IJPL-115548 */)
   @RequiresReadLockAbsence(generateAssertion = false /* IJPL-115548 */)

@@ -110,7 +110,7 @@ internal abstract class Lsp4jServerConnector protected constructor(private val l
           }
           val text = "${descriptor.lspCommunicationChannel.javaClass.simpleName} connection closed"
           // handleMaybeUnexpectedServerStop normally tires to run shutdown & exit, it's important NOT to do it in this finally block
-          manager?.handleMaybeUnexpectedServerStop(lspClient, text)
+          manager?.handleMaybeUnexpectedServerStop(lspClient, text, serverGone = true)
         }
       }
     }
@@ -180,14 +180,18 @@ internal abstract class Lsp4jServerConnector protected constructor(private val l
   }
 
   private fun disconnectAndNotifyStopped() {
-    try {
+    val release = runCatching {
       lsCommunicationLogger?.let { LanguageServiceLoggerService.getInstance().disconnect(it) }
       lsCommunicationLogger = null
       disconnect()
     }
-    finally {
+    try {
       descriptor.lspServerListener?.serverStopped(lspClient.state == LspServerState.ShutdownNormally)
     }
+    finally {
+      release.fold({ lspClient.disconnected.complete(Unit) }, { lspClient.disconnected.completeExceptionally(it) })
+    }
+    release.getOrThrow()
   }
 
   private fun createMessageJsonHandler(): MessageJsonHandler {

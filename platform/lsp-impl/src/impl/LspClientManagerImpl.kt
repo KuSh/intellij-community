@@ -39,12 +39,15 @@ import com.intellij.util.concurrency.annotations.RequiresReadLock
 import com.intellij.util.containers.ContainerUtil
 import com.intellij.util.containers.addIfNotNull
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import org.jetbrains.annotations.ApiStatus
 import org.jetbrains.annotations.TestOnly
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicLong
+import kotlin.time.Duration
 
 private val logger = logger<LspClientManagerImpl>()
 private const val MAX_LSP_CLIENTS = 10
@@ -71,9 +74,14 @@ class LspClientManagerImpl internal constructor(private val project: Project, in
     addWorkspaceModelListener()
   }
 
-  private val lspClients: MutableCollection<LspClientImpl> = ContainerUtil.createLockFreeCopyOnWriteList()
+  private val lspClients: MutableList<LspClientImpl> = ContainerUtil.createLockFreeCopyOnWriteList()
 
-  /** Makes a client start in [ensureStarted] atomic with the stop-stamp write and the client snapshot in [stopClients]. */
+  /**
+   * Makes a client start in [ensureStarted] atomic with the stop-stamp writes and the client snapshot in [stopClients].
+   * It also guards [LspClientImpl.stopRequested], [autoRestartLimit], and the decisions on an automatic restart.
+   * Do not take the state lock of a client while you hold [startStopLock].
+   * [handleServerStop] runs under that state lock, and the listeners of its events can call [stopClients].
+   */
   private val startStopLock = Any()
   private val stopClock = AtomicLong()
 
@@ -82,6 +90,12 @@ class LspClientManagerImpl internal constructor(private val project: Project, in
    * A string key is required: a `Class` key would retain the classloader of an unloaded plugin.
    */
   private val lastStopStamps = ConcurrentHashMap<String, Long>()
+
+  private val autoRestartLimit = LspAutoRestartLimit.fromRegistry()
+
+  /** The pending restarts of [scheduleAutoRestart], keyed by the server id. */
+  private val pendingAutoRestarts = ConcurrentHashMap<String, Job>()
+
   @TestOnly
   private val lsp4jServerWrappers = ContainerUtil.createLockFreeCopyOnWriteList<Lsp4jServerWrapper>()
 
@@ -137,7 +151,7 @@ class LspClientManagerImpl internal constructor(private val project: Project, in
   private fun startIfNeeded(providerClass: Class<out LspIntegrationProvider>) {
     if (!TrustedProjects.isProjectTrusted(project)) return
 
-    val provider = LspIntegrationProvider.getAllExtensions().firstOrNull { it.javaClass == providerClass }
+    val provider = findProvider(providerClass)
     if (provider == null) {
       logger.error(providerClass.name + " is not loaded")
       return
@@ -178,6 +192,9 @@ class LspClientManagerImpl internal constructor(private val project: Project, in
     }
   }
 
+  private fun findProvider(providerClass: Class<out LspIntegrationProvider>): LspIntegrationProvider? =
+    LspIntegrationProvider.getAllExtensions().firstOrNull { it.javaClass == providerClass }
+
   private fun callFileOpened(provider: LspIntegrationProvider, file: VirtualFile, starter: LspStarterImpl): Unit =
     provider.fileOpened(project, file, starter)
 
@@ -197,24 +214,35 @@ class LspClientManagerImpl internal constructor(private val project: Project, in
    * When [stopClients] for the provider, or [stopRunningServer] for the same server, came after the event,
    * the request is stale and the start is skipped.
    * `null` means an explicit request that always starts. Returns the started coroutine, so a test can join it.
+   *
+   * [replacing] is a stopped client that the new client replaces.
+   * Under [startStopLock], the new client takes the place and the position of [replacing] in one step.
+   * The same lock covers the checks for a replacement. The start is skipped when a stop stamp is newer than [requestStamp],
+   * when [replacing] has [LspClientImpl.stopRequested], or when another client of the same server is listed.
+   * When the start is skipped, [replacing] stays listed in its stopped state, and the IDE logs the reason.
+   * A replacement does not change the number of clients, so the client limit does not apply to it.
    */
   internal fun ensureStarted(
     providerClass: Class<out LspIntegrationProvider>,
     descriptor: LspClientDescriptor,
     requestStamp: Long? = null,
+    replacing: LspClientImpl? = null,
   ): Job? {
-    if (!TrustedProjects.isProjectTrusted(project)) return null
+    if (!TrustedProjects.isProjectTrusted(project)) {
+      replacing?.let { logDroppedAutoRestart(it, "the project is not trusted") }
+      return null
+    }
 
     return cs.launch {
       // make sure its listener is registered before the first `clientAdded` event, so the console gets all lifecycle events
       LspServiceViewSupport.getInstance(project)
 
       readAndEdtWriteAction {
-        if (lspClients.any { it.getServerId() == getServerId(providerClass, descriptor) }) {
+        if (replacing == null && lspClients.any { it.getServerId() == getServerId(providerClass, descriptor) }) {
           return@readAndEdtWriteAction value(Unit)
         }
 
-        if (lspClients.size >= MAX_LSP_CLIENTS) {
+        if (replacing == null && lspClients.size >= MAX_LSP_CLIENTS) {
           logger.error("${lspClients.size} LSP servers are already running and one more wants to start." +
                        "To save system resources, this request will be ignored: $descriptor")
           return@readAndEdtWriteAction value(Unit)
@@ -222,15 +250,36 @@ class LspClientManagerImpl internal constructor(private val project: Project, in
 
         writeAction {
           val client = synchronized(startStopLock) {
-            if (requestStamp != null && lastStopStamp(providerClass, descriptor) > requestStamp) {
+            if (replacing == null && requestStamp != null && lastStopStamp(providerClass, descriptor) > requestStamp) {
               return@writeAction
+            }
+            if (replacing != null) {
+              val serverId = replacing.getServerId()
+              val stale = requestStamp != null && lastStopStamp(providerClass, serverId) > requestStamp
+              val dropReason = when {
+                stale -> "an explicit stop came after the restart request"
+                replacing.stopRequested -> "the client was stopped on request"
+                lspClients.any { it !== replacing && it.getServerId() == serverId } -> "another client of the same server is listed"
+                else -> null
+              }
+              if (dropReason != null) {
+                logDroppedAutoRestart(replacing, dropReason)
+                return@writeAction
+              }
             }
             val client = LspClientImpl(providerClass, descriptor, eventDispatcher.multicaster)
             client.start()
-            lspClients.add(client)
+            if (replacing != null) {
+              // the new client takes the position of the replaced client in one atomic change of the list
+              lspClients.replaceAll { if (it === replacing) client else it }
+            }
+            else {
+              lspClients.add(client)
+            }
             client
           }
           // listeners run outside the lock
+          if (replacing != null) eventDispatcher.multicaster.clientRemoved(replacing)
           eventDispatcher.multicaster.clientAdded(client)
         }
       }
@@ -247,14 +296,20 @@ class LspClientManagerImpl internal constructor(private val project: Project, in
   private fun lastStopStamp(
     providerClass: Class<out LspIntegrationProvider>,
     descriptor: LspClientDescriptor
-  ): Long =
-    maxOf(lastStopStamps.getOrDefault(providerClass.name, 0L),
-          lastStopStamps.getOrDefault(getServerId(providerClass, descriptor), 0L))
+  ): Long = lastStopStamp(providerClass, getServerId(providerClass, descriptor))
 
+  private fun lastStopStamp(providerClass: Class<out LspIntegrationProvider>, serverId: String): Long =
+    maxOf(lastStopStamps.getOrDefault(providerClass.name, 0L), lastStopStamps.getOrDefault(serverId, 0L))
+
+  /**
+   * Stops all clients of the provider.
+   * Under [startStopLock], the call writes the stop stamp of the provider and sets [LspClientImpl.stopRequested] for each client.
+   * Then it stops each client with [stopRunningServer].
+   */
   override fun stopClients(providerClass: Class<out LspIntegrationProvider>) {
     val clients = synchronized(startStopLock) {
       lastStopStamps[providerClass.name] = stopClock.incrementAndGet()
-      getClients(providerClass)
+      getClients(providerClass).onEach { it.stopRequested = true }
     }
     clients.forEach { stopRunningServer(it) }
   }
@@ -268,10 +323,18 @@ class LspClientManagerImpl internal constructor(private val project: Project, in
    * Called when the server works fine but needs to be stopped for some reason.
    * For example, an action like `Stop server` or `Restart server` is invoked, or the project is closed.
    * The stamp is keyed by the server id, so the stop does not drop a queued sibling start of the same provider.
+   *
+   * [lspClient] can be a client that is no longer listed.
+   * Under [startStopLock], the call sets [LspClientImpl.stopRequested] and writes the stop stamp of the server id.
+   * It also cancels the pending automatic restart of the server id and clears the restart count of the server id.
    */
   internal fun stopRunningServer(lspClient: LspClientImpl) {
+    val serverId = lspClient.getServerId()
     synchronized(startStopLock) {
-      lastStopStamps[lspClient.getServerId()] = stopClock.incrementAndGet()
+      lspClient.stopRequested = true
+      lastStopStamps[serverId] = stopClock.incrementAndGet()
+      pendingAutoRestarts.remove(serverId)?.cancel()
+      autoRestartLimit.clear(serverId)
     }
     lspClient.ensureServerStopped(explicitStop = true) {
       handleServerStop(lspClient, explicitStop = true)
@@ -294,12 +357,94 @@ class LspClientManagerImpl internal constructor(private val project: Project, in
    * 1. This might be expected because the server has recently been stopped by calling [stopRunningServer].
    * In this case, this function doesn't do anything.
    * 2. Otherwise, the server termination is treated as an unexpected one.
+   *
+   * [serverGone] is `true` when the server process ended or the connection to the server closed.
+   * It is `false` for a failure in the IDE during the start of the client.
+   * Only the report that stops the client decides on an automatic restart.
+   * With [serverGone] and a client in the Running state, [scheduleAutoRestart] can start a new client.
+   * It does so only for a descriptor with [LspClientDescriptor.autoRestartSupport].
    */
-  internal fun handleMaybeUnexpectedServerStop(lspClient: LspClientImpl, serverOutput: String) =
-    lspClient.ensureServerStopped(explicitStop = false) {
-      if (lspClient.state != LspServerState.ShutdownNormally) lspClient.appendServerErrorOutput(serverOutput)
-      handleServerStop(lspClient, explicitStop = false)
+  internal fun handleMaybeUnexpectedServerStop(lspClient: LspClientImpl, serverOutput: String, serverGone: Boolean) {
+    lspClient.ensureServerStopped(
+      explicitStop = false,
+      afterStop = { previousState -> if (serverGone && previousState == LspServerState.Running) scheduleAutoRestart(lspClient) },
+      updateLspServerManagerState = {
+        if (lspClient.state != LspServerState.ShutdownNormally) lspClient.appendServerErrorOutput(serverOutput)
+        handleServerStop(lspClient, explicitStop = false)
+      },
+    )
+  }
+
+  /**
+   * Starts a new client for [lspClient] after a delay.
+   * The server of [lspClient] stopped unexpectedly while the client was running.
+   * The call does nothing when the descriptor of [lspClient] does not set [LspClientDescriptor.autoRestartSupport].
+   * The call does nothing for a client with [LspClientImpl.stopRequested].
+   * [LspAutoRestartLimit] sets the delay and can refuse the restart.
+   * The restart is a start request with the stamp of this call, and it never writes a stop stamp.
+   */
+  private fun scheduleAutoRestart(lspClient: LspClientImpl) {
+    if (project.isDisposed || !lspClient.descriptor.autoRestartSupport) return
+    val serverId = lspClient.getServerId()
+    val decision = synchronized(startStopLock) {
+      if (lspClient.stopRequested) return
+      autoRestartLimit.grant(serverId).also {
+        if (it is LspAutoRestartLimit.Decision.Granted) launchAutoRestart(lspClient, serverId, it.delay, stopClock.get())
+      }
     }
+    when (decision) {
+      is LspAutoRestartLimit.Decision.Granted ->
+        lspClient.logInfo("The LSP server stopped unexpectedly. The IDE starts it again in ${decision.delay}.")
+      LspAutoRestartLimit.Decision.Refused ->
+        lspClient.logWarn("The LSP server stopped unexpectedly too often. The IDE does not start it again.")
+      LspAutoRestartLimit.Decision.Disabled -> Unit
+    }
+  }
+
+  /**
+   * The restart waits for [LspClientImpl.disconnected], so the IDE releases the stopped server before the new client starts.
+   * When the release fails, the restart does not occur.
+   * The job stays pending until the start of the new client commits or is dropped.
+   * A cancellation of the job stops only the wait. The checks in [ensureStarted] drop a start that has already begun.
+   */
+  private fun launchAutoRestart(lspClient: LspClientImpl, serverId: String, restartDelay: Duration, requestStamp: Long) {
+    val job = cs.launch(start = CoroutineStart.LAZY) {
+      delay(restartDelay)
+      lspClient.disconnected.join()
+      if (lspClient.disconnected.isCancelled) {
+        logDroppedAutoRestart(lspClient, "the IDE could not release the stopped server")
+        return@launch
+      }
+      restartAfterUnexpectedStop(lspClient, requestStamp)?.join()
+    }
+    pendingAutoRestarts.put(serverId, job)?.cancel()
+    job.invokeOnCompletion { pendingAutoRestarts.remove(serverId, job) }
+    job.start()
+  }
+
+  /**
+   * Replaces the stopped [lspClient] with a new client that has the same descriptor.
+   * [requestStamp] is the stamp of the start request from [scheduleAutoRestart].
+   * The call does nothing when the provider is unloaded.
+   * Otherwise, [ensureStarted] replaces [lspClient] or skips the start.
+   * When it skips the start, [lspClient] stays listed in its stopped state.
+   * Returns the started coroutine, so a test can join it.
+   */
+  internal fun restartAfterUnexpectedStop(lspClient: LspClientImpl, requestStamp: Long): Job? {
+    val providerClass = lspClient.providerClass
+    if (findProvider(providerClass) == null) {
+      logDroppedAutoRestart(lspClient, "the integration provider is unloaded")
+      return null
+    }
+    return ensureStarted(providerClass, lspClient.descriptor, requestStamp, replacing = lspClient)
+  }
+
+  private fun logDroppedAutoRestart(lspClient: LspClientImpl, reason: String) {
+    lspClient.logInfo("The IDE does not start the LSP server again, because $reason.")
+  }
+
+  @TestOnly
+  internal fun pendingAutoRestartJobs(): Collection<Job> = pendingAutoRestarts.values.toList()
 
   /**
    * Called from [stopRunningServer] and from [handleMaybeUnexpectedServerStop]. Not expected to be called from anywhere else.
@@ -327,7 +472,7 @@ class LspClientManagerImpl internal constructor(private val project: Project, in
     }
     else {
       // ShutdownUnexpectedly servers stay in the `lspClients` collection so that they show up as 'Terminated' in the status bar widget.
-      // By the way, maybe try to auto-restart the server a couple of times if it has shutdown unexpectedly?
+      // `scheduleAutoRestart` replaces such a client with a new client only when its descriptor has `autoRestartSupport`.
     }
 
     if (lspClient.state == LspServerState.Running) {
